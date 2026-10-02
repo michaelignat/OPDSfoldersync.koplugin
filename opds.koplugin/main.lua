@@ -1,0 +1,190 @@
+local AutoSync = require("autosync")
+local BD = require("ui/bidi")
+local ConfirmBox = require("ui/widget/confirmbox")
+local DataStorage = require("datastorage")
+local Dispatcher = require("dispatcher")
+local LuaSettings = require("luasettings")
+local OPDSBrowser = require("opdsbrowser")
+local UIManager = require("ui/uimanager")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local util = require("util")
+local _ = require("gettext")
+local T = require("ffi/util").template
+
+local BROWSER_OPEN_RETRY_SECONDS = 0.25
+
+local OPDS = WidgetContainer:extend{
+    name = "opds",
+    settings_file = DataStorage:getSettingsDir() .. "/opds.lua",
+    settings = nil,
+    opds_settings = nil,
+    servers = nil,
+    downloads = nil,
+    pending_syncs = nil,
+    updated = nil,
+    default_servers = {
+        {
+            title = "Project Gutenberg",
+            url = "https://m.gutenberg.org/ebooks.opds/?format=opds",
+        },
+        {
+            title = "Standard Ebooks",
+            url = "https://standardebooks.org/feeds/opds",
+        },
+        {
+            title = "ManyBooks",
+            url = "http://manybooks.net/opds/index.php",
+        },
+        {
+            title = "Internet Archive",
+            url = "https://bookserver.archive.org/",
+        },
+        {
+            title = "textos.info (Spanish)",
+            url = "https://www.textos.info/catalogo.atom",
+        },
+        {
+            title = "Gallica (French)",
+            url = "https://gallica.bnf.fr/opds",
+        },
+    },
+}
+
+function OPDS:init()
+    self:onDispatcherRegisterActions()
+    self.ui.menu:registerToMainMenu(self)
+    self:loadSettings()
+    AutoSync:attach(self)
+end
+
+function OPDS:loadSettings()
+    if self.settings then return end
+    self.settings = LuaSettings:open(self.settings_file)
+    if next(self.settings.data) == nil then
+        self.updated = true -- first run, force flush
+    end
+    self.opds_settings = self.settings:readSetting("settings", {})
+    self.servers = self.settings:readSetting("servers", self.default_servers)
+    self.downloads = self.settings:readSetting("downloads", {})
+    self.pending_syncs = self.settings:readSetting("pending_syncs", {})
+end
+
+function OPDS:onDispatcherRegisterActions()
+    Dispatcher:registerAction("opds_show_catalog",
+        {category="none", event="ShowOPDSCatalog", title=_("OPDS Catalog"), filemanager=true,}
+    )
+end
+
+function OPDS:addToMainMenu(menu_items)
+    if not self.ui.document then -- FileManager menu only
+        menu_items.opds = {
+            text = _("OPDS catalog"),
+            callback = function()
+                self:onShowOPDSCatalog()
+            end,
+        }
+    end
+end
+
+function OPDS:onShowOPDSCatalog()
+    if self.opds_browser then return end
+    if not AutoSync:openBrowser(self) then
+        self.open_browser_task = self.open_browser_task or function() self:onShowOPDSCatalog() end
+        UIManager:unschedule(self.open_browser_task)
+        UIManager:scheduleIn(BROWSER_OPEN_RETRY_SECONDS, self.open_browser_task)
+        return
+    end
+    self:loadSettings()
+    self.opds_browser = OPDSBrowser:new{
+        settings = self.opds_settings,
+        servers = self.servers,
+        downloads = self.downloads,
+        pending_syncs = self.pending_syncs,
+        title = _("OPDS catalog"),
+        is_popout = false,
+        is_borderless = true,
+        title_bar_fm_style = true,
+        _manager = self,
+        file_downloaded_callback = function(file)
+            self:showFileDownloadedDialog(file)
+        end,
+        file_read_now_callback = function(file)
+            self:openDownloadedFile(file)
+        end,
+        close_callback = function()
+            if self.opds_browser.download_list then
+                self.opds_browser.download_list.close_callback()
+            end
+            UIManager:close(self.opds_browser)
+            self.opds_browser = nil
+            self:onFlushSettings()
+            AutoSync:closeBrowser(self)
+            if self.last_downloaded_file then
+                if self.ui.file_chooser then
+                    local pathname = util.splitFilePathName(self.last_downloaded_file)
+                    self.ui.file_chooser:changeToPath(pathname, self.last_downloaded_file)
+                end
+                self.last_downloaded_file = nil
+            end
+        end,
+    }
+    UIManager:show(self.opds_browser)
+end
+
+function OPDS:showFileDownloadedDialog(file)
+    self.last_downloaded_file = file
+    local confirm_box = ConfirmBox:new{
+        text = T(_("File saved to:\n%1\nWould you like to read the downloaded book now?"), BD.filepath(file)),
+        ok_text = _("Read now"),
+        ok_callback = function()
+            self:openDownloadedFile(file)
+        end,
+    }
+    -- As the InfoMessage "Downloading" is getting closed, show this ConfirmBox on the next UI tick to avoid e-Ink rendering congestion
+    UIManager:nextTick(function()
+        UIManager:show(confirm_box)
+    end)
+end
+
+-- Closes the browser and opens the book, either freshly downloaded or already on disk
+function OPDS:openDownloadedFile(file)
+    -- No need to have close_callback() navigate the file browser to the file, we're opening it
+    self.last_downloaded_file = nil
+    self.opds_browser.close_callback()
+    if self.ui.document then
+        self.ui:switchDocument(file)
+    else
+        self.ui:openFile(file)
+    end
+end
+
+function OPDS:onFlushSettings()
+    if self.updated then
+        self.settings:flush()
+        self.updated = nil
+    end
+end
+
+function OPDS:onResume()
+    AutoSync:resume(self)
+end
+
+function OPDS:onNetworkConnected()
+    AutoSync:networkConnected(self)
+end
+
+function OPDS:onRequestSuspend()
+    AutoSync:suspend(self)
+end
+
+function OPDS:onSuspend()
+    AutoSync:suspend(self)
+end
+
+function OPDS:onCloseWidget()
+    if self.open_browser_task then UIManager:unschedule(self.open_browser_task) end
+    AutoSync:detach(self)
+    self:onFlushSettings()
+end
+
+return OPDS
